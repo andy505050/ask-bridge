@@ -914,6 +914,7 @@ fn run_update_command() -> Result<(), String> {
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct Page {
     id: usize,
     url: String,
@@ -2594,17 +2595,40 @@ fn parse_pages(text: &str) -> Vec<Page> {
                 Ok(id) => id,
                 Err(_) => continue,
             };
-            let rest = rest.trim();
-            let (url, selected) = if rest.ends_with("[selected]") {
-                let url = rest.strip_suffix("[selected]").unwrap().trim().to_string();
-                (url, true)
-            } else {
-                (rest.to_string(), false)
+            let mut rest = rest.trim();
+
+            // chrome-devtools-mcp 可能在行尾附加 ` isolatedContext=<name>`。
+            if let Some(pos) = rest.rfind(" isolatedContext=") {
+                rest = rest[..pos].trim_end();
+            }
+
+            let (rest, selected) = match rest.strip_suffix("[selected]") {
+                Some(prefix) => (prefix.trim_end(), true),
+                None => (rest, false),
             };
+
+            let url = extract_page_url(rest);
             pages.push(Page { id, url, selected });
         }
     }
     pages
+}
+
+/// 從 list_pages 的頁面欄位取出 URL。
+///
+/// chrome-devtools-mcp 1.5.0 起，有標題的頁面會輸出 `標題 (URL)`，
+/// 無標題時僅輸出 `URL`。標題與 URL 本身都可能包含括號，
+/// 因此以最後一組 ` (` 分隔並驗證括號內是合法 URL。
+fn extract_page_url(label: &str) -> String {
+    if label.ends_with(')')
+        && let Some(pos) = label.rfind(" (")
+    {
+        let candidate = &label[pos + 2..label.len() - 1];
+        if Url::parse(candidate).is_ok() {
+            return candidate.to_string();
+        }
+    }
+    label.to_string()
 }
 
 fn parse_script_result(val: &Value) -> Result<Value, String> {
@@ -3856,6 +3880,66 @@ mod tests {
 
         let error = unique_new_page_id(&before, &after).unwrap_err();
         assert!(error.contains("Could not identify the newly opened tab"));
+    }
+
+    #[test]
+    fn parses_pages_with_bare_urls() {
+        let pages =
+            parse_pages("## Pages\n0: about:blank\n1: https://chatgpt.com/c/abc123 [selected]");
+
+        assert_eq!(
+            pages,
+            vec![
+                Page {
+                    id: 0,
+                    url: "about:blank".to_string(),
+                    selected: false,
+                },
+                Page {
+                    id: 1,
+                    url: "https://chatgpt.com/c/abc123".to_string(),
+                    selected: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_pages_with_titles_and_isolated_context() {
+        let pages = parse_pages(concat!(
+            "## Pages\n",
+            "1: Ping pong reply (https://chatgpt.com/c/abc123) [selected]\n",
+            "2: ChatGPT (https://chatgpt.com/c/def456)\n",
+            "3: Weird (title) with parens (https://example.com/path_(disambiguation)) isolatedContext=incognito\n",
+            "4: https://gemini.google.com/app [selected] isolatedContext=work",
+        ));
+
+        assert_eq!(
+            pages,
+            vec![
+                Page {
+                    id: 1,
+                    url: "https://chatgpt.com/c/abc123".to_string(),
+                    selected: true,
+                },
+                Page {
+                    id: 2,
+                    url: "https://chatgpt.com/c/def456".to_string(),
+                    selected: false,
+                },
+                Page {
+                    id: 3,
+                    url: "https://example.com/path_(disambiguation)".to_string(),
+                    selected: false,
+                },
+                Page {
+                    id: 4,
+                    url: "https://gemini.google.com/app".to_string(),
+                    selected: true,
+                },
+            ]
+        );
+        assert!(Provider::ChatGpt.owns_url(&pages[0].url));
     }
 
     #[test]
@@ -5741,6 +5825,26 @@ fn submit_regular_prompt(
                 try {
                     const composerSelectors = __COMPOSER_SELECTORS__;
                     const sendSelectors = __SEND_SELECTORS__;
+                    const stopSelectors = __STOP_SELECTORS__;
+                    const isVisible = (el) => {
+                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+                    const isStopButton = (el) => stopSelectors.some((s) => {
+                        try { return el.matches(s); } catch (e) { return false; }
+                    });
+
+                    // 若前次回應的停止按鈕仍卡在畫面上（前端誤以為仍在生成），
+                    // 先點擊解除，避免稍後把停止按鈕誤認為送出按鈕。
+                    const stuckStop = stopSelectors.map((s) => document.querySelector(s)).find(isVisible);
+                    if (stuckStop) {
+                        stuckStop.click();
+                        await new Promise(r => setTimeout(r, 750));
+                    }
+
                     const el = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
                     if (!el) {
                         window.__submit_status = 'error: composer not found';
@@ -5799,23 +5903,15 @@ fn submit_regular_prompt(
                         }
                     }
                     
-                    const isVisible = (el) => {
-                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
-                        const style = window.getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                        const rect = el.getBoundingClientRect();
-                        return rect.width > 0 && rect.height > 0;
-                    };
                     const findAndClickSendButton = () => {
-                        let btn = null;
                         for (const s of sendSelectors) {
-                            btn = document.querySelector(s);
-                            if (isVisible(btn)) break;
-                        }
-                        
-                        if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-                            btn.click();
-                            return { ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') };
+                            const btn = document.querySelector(s);
+                            // ChatGPT 的送出/停止按鈕共用 #composer-submit-button，
+                            // 必須排除停止型態，否則會誤點成「停止回應」。
+                            if (isVisible(btn) && !isStopButton(btn)) {
+                                btn.click();
+                                return { ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') };
+                            }
                         }
                         return null;
                     };
@@ -5844,6 +5940,7 @@ fn submit_regular_prompt(
         }"#
     .replace("__COMPOSER_SELECTORS__", provider.composer_selectors_json())
     .replace("__SEND_SELECTORS__", provider.send_button_selectors_json())
+    .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json())
     .replace("__PROMPT__", &prompt_json);
 
     let start_res = call_mcp_tool(
@@ -5900,6 +5997,7 @@ fn submit_chatgpt_agent_prompt(
             (async () => {
                 try {
                     const sendSelectors = __SEND_SELECTORS__;
+                    const stopSelectors = __STOP_SELECTORS__;
                     const el = document.querySelector('#prompt-textarea');
                     if (!el) {
                         window.__submit_status = 'error: composer not found';
@@ -5970,15 +6068,26 @@ fn submit_chatgpt_agent_prompt(
                         const rect = el.getBoundingClientRect();
                         return rect.width > 0 && rect.height > 0;
                     };
+                    const isStopButton = (el) => stopSelectors.some((s) => {
+                        try { return el.matches(s); } catch (e) { return false; }
+                    });
+
+                    // 若前次回應的停止按鈕仍卡在畫面上（前端誤以為仍在生成），
+                    // 先點擊解除，讓真正的送出按鈕得以出現。
+                    const stuckStop = stopSelectors.map((s) => document.querySelector(s)).find(isVisible);
+                    if (stuckStop) {
+                        stuckStop.click();
+                        await new Promise(r => setTimeout(r, 750));
+                    }
                     const findAndClickSendButton = () => {
-                        let btn = null;
                         for (const s of sendSelectors) {
-                            btn = document.querySelector(s);
-                            if (isVisible(btn)) break;
-                        }
-                        if (btn && !btn.disabled && btn.getAttribute('aria-disabled') !== 'true') {
-                            btn.click();
-                            return { ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') };
+                            const btn = document.querySelector(s);
+                            // ChatGPT 的送出/停止按鈕共用 #composer-submit-button，
+                            // 必須排除停止型態，否則會誤點成「停止回應」。
+                            if (isVisible(btn) && !isStopButton(btn)) {
+                                btn.click();
+                                return { ok: true, clicked: true, buttonLabel: btn.getAttribute('aria-label') };
+                            }
                         }
                         return null;
                     };
@@ -6008,6 +6117,10 @@ fn submit_chatgpt_agent_prompt(
     .replace(
         "__SEND_SELECTORS__",
         Provider::ChatGpt.send_button_selectors_json(),
+    )
+    .replace(
+        "__STOP_SELECTORS__",
+        Provider::ChatGpt.stop_button_selectors_json(),
     )
     .replace("__BODY__", &body_json);
 
@@ -7012,6 +7125,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut finished = false;
     let mut wait_cycles = 0;
     let mut stable_done_checks = 0;
+    let mut stall_last_len: u64 = 0;
+    let mut stall_since: Option<Instant> = None;
+    // ChatGPT 前端偶爾在回應完成後仍殘留停止按鈕（誤以為仍在生成）。
+    // 若已出現新回應、無任何串流/忙碌指示、且內容長度持續這麼久未變，
+    // 則視為回應已完成，避免等待迴圈卡死到逾時。
+    const STALL_COMPLETION_SECS: u64 = 90;
     let spinner_frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut spinner_idx = 0;
 
@@ -7046,16 +7165,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     const stopButton = stopSelectors.map((selector) => document.querySelector(selector)).find(isVisible);
                     const messages = document.querySelectorAll(__ASSISTANT_SELECTOR__);
                     const isNew = messages.length > __INITIAL_COUNT__;
+                    const lastMessage = messages[messages.length - 1];
+                    const lastLen = lastMessage ? (lastMessage.innerText || '').length : 0;
+                    const busy = Boolean(document.querySelector(
+                        '.result-streaming, [data-is-streaming="true"], [aria-busy="true"], [class*="shimmer"], [class*="animate-pulse"]'
+                    ));
                     
                     if (isVisible(stopButton)) {
-                        return { status: "generating", isNew: isNew };
+                        return { status: "generating", isNew: isNew, lastLen: lastLen, busy: busy };
                     }
                     
                     if (isNew) {
-                        return { status: "done", isNew: isNew };
+                        return { status: "done", isNew: isNew, lastLen: lastLen, busy: busy };
                     }
                     
-                    return { status: "waiting", isNew: isNew };
+                    return { status: "waiting", isNew: isNew, lastLen: lastLen, busy: busy };
                 }"#
             .replace("__STOP_SELECTORS__", stop_selectors)
             .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
@@ -7085,6 +7209,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(parsed) = parse_script_result(&check_res) {
                 let status = parsed["status"].as_str().unwrap_or("waiting");
                 let is_new = parsed["isNew"].as_bool().unwrap_or(false);
+                let last_len = parsed["lastLen"].as_u64().unwrap_or(0);
+                let busy = parsed["busy"].as_bool().unwrap_or(false);
 
                 if status == "done" && is_new {
                     stable_done_checks += 1;
@@ -7093,6 +7219,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else {
                     stable_done_checks = 0;
+                }
+
+                // Stall 後援：停止按鈕卡住但回應內容早已完成的情況。
+                if status == "generating" && is_new && !busy && last_len > 0 {
+                    if last_len == stall_last_len {
+                        if let Some(since) = stall_since {
+                            if since.elapsed() >= Duration::from_secs(STALL_COMPLETION_SECS) {
+                                if command_verbose {
+                                    println!(
+                                        "\nResponse content has been stable for {}s with a lingering stop button; treating it as complete.",
+                                        STALL_COMPLETION_SECS
+                                    );
+                                }
+                                // 點擊卡住的停止按鈕，讓前端結束「生成中」狀態，
+                                // 促使回應工具列（複製按鈕）出現。
+                                let dismiss_js = r#"() => {
+                                        const stopSelectors = __STOP_SELECTORS__;
+                                        const btn = stopSelectors.map((s) => document.querySelector(s)).find(Boolean);
+                                        if (btn) { btn.click(); return true; }
+                                        return false;
+                                    }"#
+                                .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json());
+                                let _ = call_mcp_tool(
+                                    &config_path,
+                                    "evaluate_script",
+                                    serde_json::json!({ "function": dismiss_js }),
+                                );
+                                thread::sleep(Duration::from_millis(1000));
+                                finished = true;
+                            }
+                        } else {
+                            stall_since = Some(Instant::now());
+                        }
+                    } else {
+                        stall_last_len = last_len;
+                        stall_since = Some(Instant::now());
+                    }
+                } else {
+                    stall_last_len = last_len;
+                    stall_since = None;
                 }
             }
         }
