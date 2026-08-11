@@ -5657,6 +5657,9 @@ fn submit_regular_prompt(
                             configurable: true
                         });
                         el.dispatchEvent(event);
+                        // 等待 React 非同步處理 paste 事件，避免同步讀取仍為空而誤判
+                        // paste 失敗，導致 insertText fallback 重複插入文字（pingping）。
+                        await new Promise(r => setTimeout(r, 50));
                         
                         const currentText = typeof el.value !== 'undefined' ? el.value : el.textContent;
                         if (currentText && currentText.trim().length > 0) {
@@ -5822,6 +5825,9 @@ fn submit_chatgpt_agent_prompt(
                             configurable: true
                         });
                         el.dispatchEvent(event);
+                        // 等待 React 非同步處理 paste 事件，避免同步讀取誤判 paste 失敗
+                        // 而走 insertText fallback，造成文字重複插入。
+                        await new Promise(r => setTimeout(r, 50));
                         const afterPasteText = el.innerText || el.textContent || '';
                         pasted = afterPasteText.includes(body);
                     } catch (e) {}
