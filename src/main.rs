@@ -1502,7 +1502,7 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     // command-line identity matching (the recorded command line is in UNC form).
     let launch_arg = chrome_profile_launch_arg()?;
 
-    if TcpStream::connect("127.0.0.1:9223").is_ok() {
+    if debug_port_is_listening() {
         let snapshot = inspect_chrome_debug_port(&launch_arg);
         if debug_listener_scope_is_unambiguous(&snapshot.listener_pids)
             && chrome_record_matches_current(
@@ -1631,7 +1631,7 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     let startup_deadline = Instant::now() + Duration::from_secs(15);
     let mut last_identity_error = None;
     while Instant::now() < startup_deadline {
-        if TcpStream::connect("127.0.0.1:9223").is_ok() {
+        if debug_port_is_listening() {
             let snapshot = inspect_chrome_debug_port(&launch_arg);
             if let Some(record) =
                 build_chrome_process_record(&snapshot.listener_pids, snapshot.browser_id.as_deref())
@@ -1847,6 +1847,16 @@ fn parse_windows_netstat_listener_pids(output: &str, port: u16) -> Vec<String> {
         }
     }
     pids
+}
+
+/// Returns true iff something is actually listening on the debug port 9223.
+///
+/// Uses the OS-native listener enumeration (`netstat`/`lsof`) instead of a raw
+/// `TcpStream::connect`. Under WSL2 the localhost relay accepts connections on
+/// the WSL side even when nothing is listening on the Windows host, so a raw
+/// connect always "succeeds" and cannot be used as a liveness check.
+fn debug_port_is_listening() -> bool {
+    !debug_port_listener_pids().is_empty()
 }
 
 fn debug_port_listener_pids() -> Vec<String> {
@@ -2071,7 +2081,7 @@ fn is_debug_chrome_background(profile_path: &str) -> bool {
 fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     let snapshot = inspect_chrome_debug_port(profile_path);
     if snapshot.listener_pids.is_empty() {
-        if TcpStream::connect("127.0.0.1:9223").is_ok() {
+        if debug_port_is_listening() {
             return Err(
                 "Port 9223 is active, but ask-bridge could not identify its listener process. No process was closed."
                     .to_string(),
@@ -2116,7 +2126,7 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     }
 
     for _ in 0..50 {
-        if TcpStream::connect("127.0.0.1:9223").is_err() {
+        if !debug_port_is_listening() {
             let _ = remove_chrome_pid_file();
             return Ok(true);
         }
