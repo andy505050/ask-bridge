@@ -1172,19 +1172,7 @@ fn chrome_profile_path() -> Result<String, String> {
 /// it reliably.
 #[cfg(target_os = "linux")]
 fn wsl_windows_profile_path() -> Result<String, String> {
-    let local_app_data = {
-        let output = Command::new("cmd.exe")
-            .args(["/c", "echo", "%LOCALAPPDATA%"])
-            .output()
-            .map_err(|e| format!("Failed to query Windows LOCALAPPDATA: {}", e))?;
-        if !output.status.success() {
-            return Err("cmd.exe failed to resolve Windows LOCALAPPDATA.".to_string());
-        }
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    };
-    if local_app_data.is_empty() {
-        return Err("Could not resolve Windows LOCALAPPDATA.".to_string());
-    }
+    let local_app_data = wsl_windows_local_app_data()?;
 
     let win_profile = format!(r"{}\ask-bridge\chrome-profile", local_app_data);
     let mount_path = wslpath_to_linux(&win_profile)?;
@@ -1192,6 +1180,32 @@ fn wsl_windows_profile_path() -> Result<String, String> {
         .map_err(|e| format!("Failed to create chrome profile directory: {}", e))?;
 
     Ok(win_profile)
+}
+
+/// Resolves the Windows `%LOCALAPPDATA%` directory from inside WSL as a native
+/// Windows path (e.g. `C:\Users\<user>\AppData\Local`). Uses PowerShell with
+/// the console output encoding forced to UTF-8: piping `cmd.exe /c echo`
+/// through WSL interop emits the console OEM code page (e.g. CP950), which
+/// mangles non-ASCII Windows user names into U+FFFD.
+#[cfg(target_os = "linux")]
+fn wsl_windows_local_app_data() -> Result<String, String> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }; Write-Output $env:LOCALAPPDATA",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to query Windows LOCALAPPDATA: {}", e))?;
+    if !output.status.success() {
+        return Err("PowerShell failed to resolve Windows LOCALAPPDATA.".to_string());
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return Err("Could not resolve Windows LOCALAPPDATA.".to_string());
+    }
+    Ok(value)
 }
 
 /// Converts a Windows path (e.g. `C:\Users\...`) to its WSL `/mnt` mount path
@@ -1311,6 +1325,12 @@ fn browser_id_from_version_response(response: &str) -> Option<String> {
     browser_id_from_websocket_url(&websocket_url)
 }
 
+/// Returns true once a WebSocket upgrade response is complete: `101 Switching
+/// Protocols` has no body, so the response ends at the header terminator.
+fn websocket_handshake_is_complete(response: &[u8]) -> bool {
+    response.windows(4).any(|window| window == b"\r\n\r\n")
+}
+
 fn http_response_is_complete(response: &[u8]) -> bool {
     let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
         return false;
@@ -1385,6 +1405,31 @@ fn debug_browser_id() -> Option<String> {
     browser_id_from_version_response(&fetch_cdp_version_response()?)
 }
 
+/// Returns true iff a raw TCP connection to `127.0.0.1:9223` can be
+/// established. Used under WSL to distinguish "Chrome is listening on the
+/// Windows host and reachable" from "listening but unreachable": in WSL2's
+/// default NAT networking mode the Linux-side localhost is NOT forwarded to
+/// the Windows host (only the Windows→WSL direction is), so `netstat.exe`
+/// reports a listener while every CDP connection fails.
+#[cfg(target_os = "linux")]
+fn debug_port_is_reachable() -> bool {
+    TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], 9223)),
+        Duration::from_millis(500),
+    )
+    .is_ok()
+}
+
+/// Error explaining that the WSL distro cannot reach the Windows-host debug
+/// port, with actionable guidance (WSL2 default NAT networking).
+#[cfg(target_os = "linux")]
+fn wsl_loopback_unreachable_error() -> String {
+    "Chrome is listening on port 9223 on the Windows host, but this WSL distro cannot reach it via 127.0.0.1. \
+     WSL2's default NAT networking does not forward Linux-side localhost to the Windows host. \
+     Enable mirrored networking by adding `networkingMode=mirrored` under `[wsl2]` in `%UserProfile%\\.wslconfig` on Windows, then run `wsl --shutdown` and retry."
+        .to_string()
+}
+
 /// Returns the browser `webSocketDebuggerUrl` from `GET /json/version`.
 fn debug_websocket_url() -> Option<String> {
     websocket_url_from_version_response(&fetch_cdp_version_response()?)
@@ -1436,7 +1481,11 @@ fn cdp_browser_close() -> Result<(), String> {
     let mut buffer = [0_u8; 4096];
     let mut handshake = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !http_response_is_complete(&handshake) && Instant::now() < deadline {
+    // A `101 Switching Protocols` response has no body, so the handshake is
+    // complete at the header terminator. `http_response_is_complete` would wait
+    // for a `Content-Length` header that 101 responses never carry, stalling
+    // every close on the 3-second read timeout.
+    while !websocket_handshake_is_complete(&handshake) && Instant::now() < deadline {
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => handshake.extend_from_slice(&buffer[..n]),
@@ -1541,16 +1590,20 @@ fn is_wsl() -> bool {
 /// Candidate paths for the Windows-host Google Chrome executable, reachable
 /// from inside WSL via `/mnt/c`. Mirrors the standard Windows search order in
 /// `find_chrome_path` (Program Files, Program Files (x86), LocalAppData).
+/// `local_app_data_mount` is the WSL mount of the Windows `%LOCALAPPDATA%`
+/// directory (e.g. `/mnt/c/Users/<windows-user>/AppData/Local`); it must be
+/// resolved from Windows because the WSL `$USER` name can differ from the
+/// Windows account name.
 #[cfg(any(target_os = "linux", test))]
-fn wsl_chrome_candidates(user: &str) -> Vec<String> {
+fn wsl_chrome_candidates(local_app_data_mount: &str) -> Vec<String> {
     let mut candidates = vec![
         "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe".to_string(),
         "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe".to_string(),
     ];
-    if !user.is_empty() {
+    if !local_app_data_mount.is_empty() {
         candidates.push(format!(
-            "/mnt/c/Users/{}/AppData/Local/Google/Chrome/Application/chrome.exe",
-            user
+            "{}/Google/Chrome/Application/chrome.exe",
+            local_app_data_mount.trim_end_matches('/')
         ));
     }
     candidates
@@ -1609,8 +1662,12 @@ fn find_chrome_path() -> Result<String, String> {
     #[cfg(target_os = "linux")]
     {
         if is_wsl() {
-            let user = std::env::var("USER").unwrap_or_default();
-            for candidate in wsl_chrome_candidates(&user) {
+            let local_app_data_mount = wsl_windows_local_app_data()
+                .ok()
+                .and_then(|win_path| wslpath_to_linux(&win_path).ok())
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            for candidate in wsl_chrome_candidates(&local_app_data_mount) {
                 if std::path::Path::new(&candidate).exists() {
                     return Ok(candidate);
                 }
@@ -1646,6 +1703,17 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     let launch_arg = chrome_profile_launch_arg()?;
 
     if debug_port_is_listening() {
+        // Under WSL, a listener visible to netstat.exe that cannot be reached
+        // from the Linux side means WSL2 NAT networking: no CDP call can ever
+        // succeed, so fail fast with actionable guidance instead of
+        // misreporting the listener as a non-ask Chrome.
+        #[cfg(target_os = "linux")]
+        {
+            if is_wsl() && !debug_port_is_reachable() {
+                return Err(wsl_loopback_unreachable_error());
+            }
+        }
+
         let snapshot = inspect_chrome_debug_port(&launch_arg);
         if debug_listener_scope_is_unambiguous(&snapshot.listener_pids)
             && chrome_record_matches_current(
@@ -1773,8 +1841,34 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     // Wait for Chrome to listen and prove that the listener belongs to this launch.
     let startup_deadline = Instant::now() + Duration::from_secs(15);
     let mut last_identity_error = None;
+    #[cfg(target_os = "linux")]
+    let mut wsl_unreachable_probes = 0_u32;
     while Instant::now() < startup_deadline {
         if debug_port_is_listening() {
+            // WSL2 NAT networking: the host Chrome is listening but the Linux
+            // side cannot reach it, so CDP identity can never come up. After a
+            // few consecutive failed probes (tolerating relay startup lag),
+            // stop early and kill the freshly launched host Chrome so it is
+            // not orphaned.
+            #[cfg(target_os = "linux")]
+            {
+                if is_wsl() {
+                    if debug_port_is_reachable() {
+                        wsl_unreachable_probes = 0;
+                    } else {
+                        wsl_unreachable_probes += 1;
+                        if wsl_unreachable_probes >= 5 {
+                            let snapshot = inspect_chrome_debug_port(&launch_arg);
+                            for pid in &snapshot.ask_pids {
+                                terminate_chrome_process(pid);
+                            }
+                            let _ = remove_chrome_pid_file();
+                            return Err(wsl_loopback_unreachable_error());
+                        }
+                    }
+                }
+            }
+
             let snapshot = inspect_chrome_debug_port(&launch_arg);
             if let Some(record) =
                 build_chrome_process_record(&snapshot.listener_pids, snapshot.browser_id.as_deref())
@@ -2019,34 +2113,36 @@ fn debug_port_listener_pids() -> Vec<String> {
     #[cfg(not(target_os = "windows"))]
     {
         #[cfg(target_os = "linux")]
-        if is_wsl() {
-            // Inside WSL the Chrome we launch is the Windows-host executable,
-            // whose listener lives in the Windows network stack; use netstat.exe.
-            let output = Command::new("/mnt/c/Windows/System32/netstat.exe")
-                .args(["-ano", "-p", "tcp"])
-                .output();
+        {
+            if is_wsl() {
+                // Inside WSL the Chrome we launch is the Windows-host executable,
+                // whose listener lives in the Windows network stack; use netstat.exe.
+                let output = Command::new("/mnt/c/Windows/System32/netstat.exe")
+                    .args(["-ano", "-p", "tcp"])
+                    .output();
 
-            match output {
-                Ok(output) if output.status.success() => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    parse_windows_netstat_listener_pids(&stdout, 9223)
-                }
-                _ => Vec::new(),
+                return match output {
+                    Ok(output) if output.status.success() => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        parse_windows_netstat_listener_pids(&stdout, 9223)
+                    }
+                    _ => Vec::new(),
+                };
             }
-        } else {
-            let output = Command::new("lsof")
-                .args(["-tiTCP:9223", "-sTCP:LISTEN"])
-                .output();
+        }
 
-            match output {
-                Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                _ => Vec::new(),
-            }
+        let output = Command::new("lsof")
+            .args(["-tiTCP:9223", "-sTCP:LISTEN"])
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
         }
     }
 }
@@ -2249,6 +2345,23 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
         );
     }
 
+    // Under WSL2 NAT networking the Linux side cannot reach the host's debug
+    // port, so the graceful CDP close can never succeed; skip straight to the
+    // force-kill fallback instead of waiting out the CDP timeouts.
+    #[cfg(target_os = "linux")]
+    {
+        if is_wsl() && !debug_port_is_reachable() {
+            for pid in &snapshot.ask_pids {
+                terminate_chrome_process(pid);
+            }
+            if wait_for_debug_port_free(Duration::from_millis(3000)) {
+                let _ = remove_chrome_pid_file();
+                return Ok(true);
+            }
+            return Err("Timed out waiting for existing ask-bridge Chrome to stop".to_string());
+        }
+    }
+
     // Terminate the ask-bridge Chrome. Prefer a graceful shutdown so Chrome can
     // flush its profile; a forced kill leaves the profile in an unclean state,
     // which surfaces as Chrome's "restore pages?" prompt and "profile error"
@@ -2285,14 +2398,17 @@ fn terminate_chrome_process(pid: &str) {
     #[cfg(not(target_os = "windows"))]
     {
         #[cfg(target_os = "linux")]
-        if is_wsl() {
-            // The Chrome process is a Windows-host process; use taskkill.exe.
-            let _ = Command::new("/mnt/c/Windows/System32/taskkill.exe")
-                .args(["/PID", pid, "/T", "/F"])
-                .status();
-        } else {
-            let _ = Command::new("kill").args(["-TERM", pid]).status();
+        {
+            if is_wsl() {
+                // The Chrome process is a Windows-host process; use taskkill.exe.
+                let _ = Command::new("/mnt/c/Windows/System32/taskkill.exe")
+                    .args(["/PID", pid, "/T", "/F"])
+                    .status();
+                return;
+            }
         }
+
+        let _ = Command::new("kill").args(["-TERM", pid]).status();
     }
 }
 
@@ -3415,7 +3531,7 @@ mod tests {
     #[cfg(any(target_os = "linux", test))]
     #[test]
     fn wsl_chrome_candidates_includes_standard_windows_paths() {
-        let candidates = wsl_chrome_candidates("alice");
+        let candidates = wsl_chrome_candidates("/mnt/c/Users/alice/AppData/Local");
         assert_eq!(
             candidates,
             vec![
@@ -3428,7 +3544,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", test))]
     #[test]
-    fn wsl_chrome_candidates_omits_user_path_when_user_is_unknown() {
+    fn wsl_chrome_candidates_omits_user_path_when_local_app_data_is_unknown() {
         let candidates = wsl_chrome_candidates("");
         assert_eq!(candidates.len(), 2);
         assert!(
