@@ -1153,6 +1153,34 @@ fn chrome_profile_path() -> Result<String, String> {
     Ok(profile_dir.to_string_lossy().to_string())
 }
 
+/// Returns the `--user-data-dir` value to pass to Chrome. On WSL the Chrome we
+/// launch is the Windows-host executable, which cannot consume a Linux path
+/// (it would fail with exit code 21); the Linux path is translated to a UNC
+/// path (`\\wsl.localhost\...`) via `wslpath -w`. On non-WSL platforms this is
+/// identical to the native profile path.
+fn chrome_profile_launch_arg() -> Result<String, String> {
+    let profile_path = chrome_profile_path()?;
+
+    #[cfg(target_os = "linux")]
+    {
+        if is_wsl() {
+            let output = Command::new("wslpath")
+                .args(["-w", &profile_path])
+                .output()
+                .map_err(|e| format!("Failed to run wslpath: {}", e))?;
+            if !output.status.success() {
+                return Err("wslpath failed to translate the profile path.".to_string());
+            }
+            let translated = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !translated.is_empty() {
+                return Ok(translated);
+            }
+        }
+    }
+
+    Ok(profile_path)
+}
+
 fn chrome_pid_path() -> Result<PathBuf, String> {
     let mut path = home::home_dir().ok_or("Could not locate home directory")?;
     path.push(".config/ask-bridge/chrome.pid");
@@ -1354,6 +1382,37 @@ fn find_linux_chrome_path(
     find_chrome_command_in_path(path_env).or_else(|| first_existing_path(path_candidates))
 }
 
+/// Detects whether this Linux process is running inside WSL (Windows Subsystem
+/// for Linux). WSL exposes a Windows interop binfmt_misc entry and a
+/// "microsoft"-tagged kernel release, both of which can be probed at runtime.
+#[cfg(any(target_os = "linux", test))]
+fn is_wsl() -> bool {
+    if std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists() {
+        return true;
+    }
+    std::fs::read_to_string("/proc/version")
+        .map(|content| content.to_ascii_lowercase().contains("microsoft"))
+        .unwrap_or(false)
+}
+
+/// Candidate paths for the Windows-host Google Chrome executable, reachable
+/// from inside WSL via `/mnt/c`. Mirrors the standard Windows search order in
+/// `find_chrome_path` (Program Files, Program Files (x86), LocalAppData).
+#[cfg(any(target_os = "linux", test))]
+fn wsl_chrome_candidates(user: &str) -> Vec<String> {
+    let mut candidates = vec![
+        "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe".to_string(),
+        "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe".to_string(),
+    ];
+    if !user.is_empty() {
+        candidates.push(format!(
+            "/mnt/c/Users/{}/AppData/Local/Google/Chrome/Application/chrome.exe",
+            user
+        ));
+    }
+    candidates
+}
+
 fn find_chrome_path() -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
@@ -1406,6 +1465,16 @@ fn find_chrome_path() -> Result<String, String> {
 
     #[cfg(target_os = "linux")]
     {
+        if is_wsl() {
+            let user = std::env::var("USER").unwrap_or_default();
+            for candidate in wsl_chrome_candidates(&user) {
+                if std::path::Path::new(&candidate).exists() {
+                    return Ok(candidate);
+                }
+            }
+            return Err("Google Chrome was not found in WSL host paths (/mnt/c). Please install Google Chrome on the Windows host.".to_string());
+        }
+
         const LINUX_CHROME_PATHS: &[&str] = &[
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
@@ -1428,9 +1497,13 @@ fn find_chrome_path() -> Result<String, String> {
 
 fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     let profile_path = chrome_profile_path()?;
+    // The Windows-host Chrome (used under WSL) consumes a UNC path, not the
+    // native Linux path. Use the launch arg for `--user-data-dir` and for any
+    // command-line identity matching (the recorded command line is in UNC form).
+    let launch_arg = chrome_profile_launch_arg()?;
 
     if TcpStream::connect("127.0.0.1:9223").is_ok() {
-        let snapshot = inspect_chrome_debug_port(&profile_path);
+        let snapshot = inspect_chrome_debug_port(&launch_arg);
         if debug_listener_scope_is_unambiguous(&snapshot.listener_pids)
             && chrome_record_matches_current(
                 snapshot.record.as_ref(),
@@ -1456,7 +1529,7 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
                     });
                 }
             }
-            if verbose && headless && !is_debug_chrome_background(&profile_path) {
+            if verbose && headless && !is_debug_chrome_background(&launch_arg) {
                 println!(
                     "Reusing existing ask-bridge Chrome on port 9223. Run `ask-bridge close` if you want to restart it in background mode."
                 );
@@ -1500,7 +1573,7 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
 
     let mut cmd = Command::new(&chrome_path);
     cmd.arg("--remote-debugging-port=9223")
-        .arg(format!("--user-data-dir={}", profile_path))
+        .arg(format!("--user-data-dir={}", launch_arg))
         .arg(ASK_BRIDGE_CHROME_MARKER)
         .arg("--no-first-run")
         .arg("--no-default-browser-check");
@@ -1559,7 +1632,7 @@ fn start_chrome_if_needed(headless: bool, verbose: bool) -> Result<(), String> {
     let mut last_identity_error = None;
     while Instant::now() < startup_deadline {
         if TcpStream::connect("127.0.0.1:9223").is_ok() {
-            let snapshot = inspect_chrome_debug_port(&profile_path);
+            let snapshot = inspect_chrome_debug_port(&launch_arg);
             if let Some(record) =
                 build_chrome_process_record(&snapshot.listener_pids, snapshot.browser_id.as_deref())
             {
@@ -1750,7 +1823,7 @@ fn ask_chrome_pids_on_debug_port(profile_path: &str) -> Vec<String> {
     inspect_chrome_debug_port(profile_path).ask_pids
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn parse_windows_netstat_listener_pids(output: &str, port: u16) -> Vec<String> {
     let mut pids = Vec::new();
     for line in output.lines() {
@@ -1792,23 +1865,40 @@ fn debug_port_listener_pids() -> Vec<String> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let output = Command::new("lsof")
-            .args(["-tiTCP:9223", "-sTCP:LISTEN"])
-            .output();
+        #[cfg(target_os = "linux")]
+        if is_wsl() {
+            // Inside WSL the Chrome we launch is the Windows-host executable,
+            // whose listener lives in the Windows network stack; use netstat.exe.
+            let output = Command::new("/mnt/c/Windows/System32/netstat.exe")
+                .args(["-ano", "-p", "tcp"])
+                .output();
 
-        match output {
-            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string)
-                .collect(),
-            _ => Vec::new(),
+            match output {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    parse_windows_netstat_listener_pids(&stdout, 9223)
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            let output = Command::new("lsof")
+                .args(["-tiTCP:9223", "-sTCP:LISTEN"])
+                .output();
+
+            match output {
+                Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            }
         }
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn parse_wmic_column_value(output: &str) -> Option<String> {
     let mut non_empty_lines = output
         .lines()
@@ -1821,50 +1911,16 @@ fn parse_wmic_column_value(output: &str) -> Option<String> {
 fn process_command(pid: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("wmic")
-            .args([
-                "process",
-                "where",
-                &format!("processid={}", pid),
-                "get",
-                "commandline",
-            ])
-            .output();
-
-        if let Ok(out) = output
-            && out.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if let Some(command) = parse_wmic_column_value(&stdout) {
-                return Some(command);
-            }
-        }
-
-        let output = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "(Get-CimInstance Win32_Process -Filter 'ProcessId = {}').CommandLine",
-                    pid
-                ),
-            ])
-            .output();
-
-        if let Ok(out) = output
-            && out.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !stdout.is_empty() {
-                return Some(stdout);
-            }
-        }
-
-        None
+        return windows_process_command(pid);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        #[cfg(target_os = "linux")]
+        if is_wsl() {
+            return windows_process_command(pid);
+        }
+
         let output = Command::new("ps")
             .args(["-p", pid, "-o", "command="])
             .output()
@@ -1878,51 +1934,67 @@ fn process_command(pid: &str) -> Option<String> {
     }
 }
 
+/// Reads the command line of a Windows process via `wmic`, falling back to
+/// PowerShell `Get-CimInstance`. Used on native Windows and, inside WSL, to
+/// inspect the Windows-host Chrome process. The `.exe` suffix is required so
+/// WSL interop can resolve these via PATH.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn windows_process_command(pid: &str) -> Option<String> {
+    let output = Command::new("wmic.exe")
+        .args([
+            "process",
+            "where",
+            &format!("processid={}", pid),
+            "get",
+            "commandline",
+        ])
+        .output();
+
+    if let Ok(out) = output
+        && out.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(command) = parse_wmic_column_value(&stdout) {
+            return Some(command);
+        }
+    }
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "(Get-CimInstance Win32_Process -Filter 'ProcessId = {}').CommandLine",
+                pid
+            ),
+        ])
+        .output();
+
+    if let Ok(out) = output
+        && out.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !stdout.is_empty() {
+            return Some(stdout);
+        }
+    }
+
+    None
+}
+
 fn process_parent_pid(pid: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("wmic")
-            .args([
-                "process",
-                "where",
-                &format!("processid={}", pid),
-                "get",
-                "parentprocessid",
-            ])
-            .output();
-
-        if let Ok(out) = output
-            && out.status.success()
-            && let Some(parent_pid) = parse_wmic_column_value(&String::from_utf8_lossy(&out.stdout))
-        {
-            return Some(parent_pid);
-        }
-
-        let output = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "(Get-CimInstance Win32_Process -Filter 'ProcessId = {}').ParentProcessId",
-                    pid
-                ),
-            ])
-            .output();
-
-        if let Ok(out) = output
-            && out.status.success()
-        {
-            let parent_pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !parent_pid.is_empty() {
-                return Some(parent_pid);
-            }
-        }
-
-        None
+        return windows_process_parent_pid(pid);
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        #[cfg(target_os = "linux")]
+        if is_wsl() {
+            return windows_process_parent_pid(pid);
+        }
+
         let output = Command::new("ps")
             .args(["-p", pid, "-o", "ppid="])
             .output()
@@ -1939,6 +2011,51 @@ fn process_parent_pid(pid: &str) -> Option<String> {
             Some(parent_pid)
         }
     }
+}
+
+/// Reads the parent PID of a Windows process via `wmic`, falling back to
+/// PowerShell `Get-CimInstance`. Used on native Windows and, inside WSL, to
+/// trace the Windows-host Chrome process chain.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn windows_process_parent_pid(pid: &str) -> Option<String> {
+    let output = Command::new("wmic.exe")
+        .args([
+            "process",
+            "where",
+            &format!("processid={}", pid),
+            "get",
+            "parentprocessid",
+        ])
+        .output();
+
+    if let Ok(out) = output
+        && out.status.success()
+        && let Some(parent_pid) = parse_wmic_column_value(&String::from_utf8_lossy(&out.stdout))
+    {
+        return Some(parent_pid);
+    }
+
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "(Get-CimInstance Win32_Process -Filter 'ProcessId = {}').ParentProcessId",
+                pid
+            ),
+        ])
+        .output();
+
+    if let Ok(out) = output
+        && out.status.success()
+    {
+        let parent_pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !parent_pid.is_empty() {
+            return Some(parent_pid);
+        }
+    }
+
+    None
 }
 
 fn is_debug_chrome_background(profile_path: &str) -> bool {
@@ -1986,7 +2103,15 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = Command::new("kill").args(["-TERM", pid]).status();
+            #[cfg(target_os = "linux")]
+            if is_wsl() {
+                // The Chrome process is a Windows-host process; use taskkill.exe.
+                let _ = Command::new("/mnt/c/Windows/System32/taskkill.exe")
+                    .args(["/PID", pid, "/T", "/F"])
+                    .status();
+            } else {
+                let _ = Command::new("kill").args(["-TERM", pid]).status();
+            }
         }
     }
 
@@ -3105,6 +3230,32 @@ mod tests {
         assert_eq!(find_linux_chrome_path(None, &[]), None);
     }
 
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn wsl_chrome_candidates_includes_standard_windows_paths() {
+        let candidates = wsl_chrome_candidates("alice");
+        assert_eq!(
+            candidates,
+            vec![
+                "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe".to_string(),
+                "/mnt/c/Program Files (x86)/Google/Chrome/Application/chrome.exe".to_string(),
+                "/mnt/c/Users/alice/AppData/Local/Google/Chrome/Application/chrome.exe".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    #[test]
+    fn wsl_chrome_candidates_omits_user_path_when_user_is_unknown() {
+        let candidates = wsl_chrome_candidates("");
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.contains("/Users/"))
+        );
+    }
+
     #[test]
     fn matches_profile_argument_with_quotes_and_slashes() {
         let command = r#""C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9223 "--user-data-dir=C:\Users\Will\.config\ask-bridge\chrome-profile""#;
@@ -3527,7 +3678,7 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     #[test]
     fn windows_netstat_parser_matches_exact_listening_port() {
         let output = concat!(
@@ -3580,7 +3731,7 @@ mod tests {
         assert_eq!(ask_pids, vec!["18000".to_string()]);
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     #[test]
     fn parses_wmic_value_after_blank_lines() {
         let output = "CommandLine\r\n\r\n  chrome.exe --remote-debugging-port=9223  \r\n\r\n";
@@ -6123,12 +6274,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if matches!(cli.command, Some(Commands::Close)) {
-        let profile_path = match chrome_profile_path() {
+        // Identity matching against the recorded Windows command line needs the
+        // same representation used at launch (UNC under WSL), so prefer the
+        // launch argument and fall back to the native profile path.
+        let profile_path = match chrome_profile_launch_arg() {
             Ok(path) => path,
-            Err(e) => {
-                eprintln!("Error locating Chrome profile: {}", e);
-                std::process::exit(1);
-            }
+            Err(_) => match chrome_profile_path() {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("Error locating Chrome profile: {}", e);
+                    std::process::exit(1);
+                }
+            },
         };
 
         match close_ask_chrome_on_debug_port(&profile_path) {
