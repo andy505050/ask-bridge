@@ -2106,34 +2106,69 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
         );
     }
 
+    // Terminate the ask-bridge Chrome. Prefer a graceful shutdown so Chrome can
+    // flush its profile; a forced kill leaves the profile in an unclean state,
+    // which surfaces as Chrome's "restore pages?" prompt and "profile error"
+    // dialog on the next launch. Only force-kill if the graceful close does not
+    // release the debug port within a short wait.
     for pid in &snapshot.ask_pids {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = Command::new("taskkill").args(["/PID", pid, "/T"]).status();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            #[cfg(target_os = "linux")]
-            if is_wsl() {
-                // The Chrome process is a Windows-host process; use taskkill.exe.
-                let _ = Command::new("/mnt/c/Windows/System32/taskkill.exe")
-                    .args(["/PID", pid, "/T", "/F"])
-                    .status();
-            } else {
-                let _ = Command::new("kill").args(["-TERM", pid]).status();
-            }
-        }
+        terminate_chrome_process(pid, false);
     }
-
-    for _ in 0..50 {
-        if !debug_port_is_listening() {
-            let _ = remove_chrome_pid_file();
-            return Ok(true);
-        }
-        thread::sleep(Duration::from_millis(100));
+    if wait_for_debug_port_free(Duration::from_millis(3000)) {
+        let _ = remove_chrome_pid_file();
+        return Ok(true);
+    }
+    for pid in &snapshot.ask_pids {
+        terminate_chrome_process(pid, true);
+    }
+    if wait_for_debug_port_free(Duration::from_millis(3000)) {
+        let _ = remove_chrome_pid_file();
+        return Ok(true);
     }
 
     Err("Timed out waiting for existing ask-bridge Chrome to stop".to_string())
+}
+
+/// Terminates a Windows-host Chrome process (native Windows or WSL interop).
+/// When `force` is false, uses a graceful close (WM_CLOSE) so Chrome can flush
+/// its profile; when true, force-kills the whole process tree.
+fn terminate_chrome_process(pid: &str, force: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        let mut args = vec!["/PID", pid, "/T"];
+        if force {
+            args.push("/F");
+        }
+        let _ = Command::new("taskkill").args(&args).status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "linux")]
+        if is_wsl() {
+            // The Chrome process is a Windows-host process; use taskkill.exe.
+            let mut args = vec!["/PID", pid, "/T"];
+            if force {
+                args.push("/F");
+            }
+            let _ = Command::new("/mnt/c/Windows/System32/taskkill.exe")
+                .args(&args)
+                .status();
+        } else {
+            let _ = Command::new("kill").args(["-TERM", pid]).status();
+        }
+    }
+}
+
+/// Waits up to `timeout` for nothing to be listening on the debug port 9223.
+fn wait_for_debug_port_free(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !debug_port_is_listening() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 static FORWARD_MCP_STDERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
