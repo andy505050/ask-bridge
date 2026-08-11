@@ -1145,6 +1145,19 @@ fn write_mcp_config(quiet_mcp: bool, headless: bool) -> Result<String, String> {
 }
 
 fn chrome_profile_path() -> Result<String, String> {
+    // Under WSL the Windows-host Chrome cannot reliably open a profile that
+    // lives on the WSL 9p mount (`\\wsl.localhost\...`): Windows file locking
+    // (`LockFileEx`) and sandbox access grants fail there with
+    // ERROR_INVALID_FUNCTION, which makes Chrome show a "profile error" dialog
+    // on every launch. So under WSL we place the profile on the native Windows
+    // filesystem and pass that path to `--user-data-dir`.
+    #[cfg(target_os = "linux")]
+    {
+        if is_wsl() {
+            return wsl_windows_profile_path();
+        }
+    }
+
     let mut profile_dir = home::home_dir().ok_or("Could not locate home directory")?;
     profile_dir.push(".config/ask-bridge/chrome-profile");
     std::fs::create_dir_all(&profile_dir)
@@ -1153,32 +1166,62 @@ fn chrome_profile_path() -> Result<String, String> {
     Ok(profile_dir.to_string_lossy().to_string())
 }
 
-/// Returns the `--user-data-dir` value to pass to Chrome. On WSL the Chrome we
-/// launch is the Windows-host executable, which cannot consume a Linux path
-/// (it would fail with exit code 21); the Linux path is translated to a UNC
-/// path (`\\wsl.localhost\...`) via `wslpath -w`. On non-WSL platforms this is
-/// identical to the native profile path.
-fn chrome_profile_launch_arg() -> Result<String, String> {
-    let profile_path = chrome_profile_path()?;
-
-    #[cfg(target_os = "linux")]
-    {
-        if is_wsl() {
-            let output = Command::new("wslpath")
-                .args(["-w", &profile_path])
-                .output()
-                .map_err(|e| format!("Failed to run wslpath: {}", e))?;
-            if !output.status.success() {
-                return Err("wslpath failed to translate the profile path.".to_string());
-            }
-            let translated = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !translated.is_empty() {
-                return Ok(translated);
-            }
+/// Under WSL, returns the native Windows profile path under `%LOCALAPPDATA%`
+/// (e.g. `C:\Users\<user>\AppData\Local\ask-bridge\chrome-profile`) and ensures
+/// the directory exists via the `/mnt` mount so the Windows-host Chrome can use
+/// it reliably.
+#[cfg(target_os = "linux")]
+fn wsl_windows_profile_path() -> Result<String, String> {
+    let local_app_data = {
+        let output = Command::new("cmd.exe")
+            .args(["/c", "echo", "%LOCALAPPDATA%"])
+            .output()
+            .map_err(|e| format!("Failed to query Windows LOCALAPPDATA: {}", e))?;
+        if !output.status.success() {
+            return Err("cmd.exe failed to resolve Windows LOCALAPPDATA.".to_string());
         }
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    if local_app_data.is_empty() {
+        return Err("Could not resolve Windows LOCALAPPDATA.".to_string());
     }
 
-    Ok(profile_path)
+    let win_profile = format!(r"{}\ask-bridge\chrome-profile", local_app_data);
+    let mount_path = wslpath_to_linux(&win_profile)?;
+    std::fs::create_dir_all(&mount_path)
+        .map_err(|e| format!("Failed to create chrome profile directory: {}", e))?;
+
+    Ok(win_profile)
+}
+
+/// Converts a Windows path (e.g. `C:\Users\...`) to its WSL `/mnt` mount path
+/// via `wslpath -u`.
+#[cfg(target_os = "linux")]
+fn wslpath_to_linux(win_path: &str) -> Result<PathBuf, String> {
+    let output = Command::new("wslpath")
+        .args(["-u", win_path])
+        .output()
+        .map_err(|e| format!("Failed to run wslpath: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("wslpath failed to translate `{}`.", win_path));
+    }
+    let translated = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if translated.is_empty() {
+        return Err(format!(
+            "wslpath returned an empty path for `{}`.",
+            win_path
+        ));
+    }
+    Ok(PathBuf::from(translated))
+}
+
+/// Returns the `--user-data-dir` value to pass to Chrome. On WSL the Chrome we
+/// launch is the Windows-host executable, which cannot consume a Linux path
+/// (it would fail with exit code 21); `chrome_profile_path()` already returns a
+/// native Windows path under WSL. On non-WSL platforms this is identical to the
+/// native profile path.
+fn chrome_profile_launch_arg() -> Result<String, String> {
+    chrome_profile_path()
 }
 
 fn chrome_pid_path() -> Result<PathBuf, String> {
@@ -1246,7 +1289,8 @@ fn browser_id_from_websocket_url(url: &str) -> Option<String> {
     (!id.is_empty() && !id.contains(['/', '?', '#'])).then(|| id.to_string())
 }
 
-fn browser_id_from_version_response(response: &str) -> Option<String> {
+/// Extracts the `webSocketDebuggerUrl` from a CDP `/json/version` HTTP response.
+fn websocket_url_from_version_response(response: &str) -> Option<String> {
     if !http_response_is_complete(response.as_bytes()) {
         return None;
     }
@@ -1259,7 +1303,12 @@ fn browser_id_from_version_response(response: &str) -> Option<String> {
     let body = body.trim();
     let version: Value = serde_json::from_str(body).ok()?;
     let websocket_url = version.get("webSocketDebuggerUrl")?.as_str()?;
-    browser_id_from_websocket_url(websocket_url)
+    Some(websocket_url.to_string())
+}
+
+fn browser_id_from_version_response(response: &str) -> Option<String> {
+    let websocket_url = websocket_url_from_version_response(response)?;
+    browser_id_from_websocket_url(&websocket_url)
 }
 
 fn http_response_is_complete(response: &[u8]) -> bool {
@@ -1283,7 +1332,7 @@ fn http_response_is_complete(response: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
-fn debug_browser_id() -> Option<String> {
+fn fetch_cdp_version_response() -> Option<String> {
     const MAX_RESPONSE_SIZE: usize = 64 * 1024;
     const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1329,8 +1378,102 @@ fn debug_browser_id() -> Option<String> {
     if !http_response_is_complete(&response) {
         return None;
     }
-    let response = String::from_utf8(response).ok()?;
-    browser_id_from_version_response(&response)
+    String::from_utf8(response).ok()
+}
+
+fn debug_browser_id() -> Option<String> {
+    browser_id_from_version_response(&fetch_cdp_version_response()?)
+}
+
+/// Returns the browser `webSocketDebuggerUrl` from `GET /json/version`.
+fn debug_websocket_url() -> Option<String> {
+    websocket_url_from_version_response(&fetch_cdp_version_response()?)
+}
+
+/// Sends a CDP `Browser.close` to the browser on the debug port 9223, requesting
+/// a graceful shutdown so Chrome can flush its profile (leaving
+/// `exit_type: "Normal"`). Implemented with a minimal raw WebSocket client over
+/// `std::net::TcpStream` so no extra dependency is needed for a one-shot close.
+fn cdp_browser_close() -> Result<(), String> {
+    const HOST: &str = "127.0.0.1";
+    const PORT: u16 = 9223;
+
+    let url = debug_websocket_url()
+        .ok_or_else(|| "無法取得 CDP browser WebSocket 位址（/json/version）".to_string())?;
+    let parsed = Url::parse(&url).map_err(|e| format!("無法解析 CDP WebSocket 位址：{e}"))?;
+    let path = if parsed.path().is_empty() {
+        "/"
+    } else {
+        parsed.path()
+    };
+    let path_and_query = parsed
+        .query()
+        .map(|q| format!("{path}?{q}"))
+        .unwrap_or_else(|| path.to_string());
+
+    let mut stream =
+        TcpStream::connect((HOST, PORT)).map_err(|e| format!("無法連線到 CDP WebSocket：{e}"))?;
+    let timeout = Some(Duration::from_secs(3));
+    stream
+        .set_read_timeout(timeout)
+        .and_then(|_| stream.set_write_timeout(timeout))
+        .map_err(|e| format!("設定 CDP socket 逾時失敗：{e}"))?;
+
+    // RFC 6455 sample key — fine for a one-shot local close.
+    let key = "dGhlIHNhbXBsZSBub25jZQ==";
+    let request = format!(
+        "GET {path_and_query} HTTP/1.1\r\n\
+         Host: {HOST}:{PORT}\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\n\
+         Sec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("發送 WebSocket 握手失敗：{e}"))?;
+
+    let mut buffer = [0_u8; 4096];
+    let mut handshake = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !http_response_is_complete(&handshake) && Instant::now() < deadline {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => handshake.extend_from_slice(&buffer[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(e) => return Err(format!("讀取 WebSocket 握手回應失敗：{e}")),
+        }
+    }
+    let handshake = String::from_utf8_lossy(&handshake);
+    let status_line = handshake.lines().next().unwrap_or("");
+    if !status_line.contains(" 101 ") {
+        return Err(format!("WebSocket 握手失敗：{status_line}"));
+    }
+
+    // Send one masked text frame: {"id":1,"method":"Browser.close"} (payload < 126).
+    let payload = br#"{"id":1,"method":"Browser.close"}"#;
+    let mask = [0x12u8, 0x34, 0x56, 0x78];
+    let mut frame = Vec::with_capacity(2 + mask.len() + payload.len());
+    frame.push(0x81); // FIN + text opcode
+    frame.push(0x80 | payload.len() as u8); // masked + length
+    frame.extend_from_slice(&mask);
+    for (i, byte) in payload.iter().enumerate() {
+        frame.push(byte ^ mask[i % mask.len()]);
+    }
+    stream
+        .write_all(&frame)
+        .map_err(|e| format!("發送 Browser.close 失敗：{e}"))?;
+
+    // Drain any response ({...}) before the browser closes the connection.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut drain = [0_u8; 1024];
+    let _ = stream.read(&mut drain);
+
+    Ok(())
 }
 
 fn build_chrome_process_record(
@@ -2109,17 +2252,17 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     // Terminate the ask-bridge Chrome. Prefer a graceful shutdown so Chrome can
     // flush its profile; a forced kill leaves the profile in an unclean state,
     // which surfaces as Chrome's "restore pages?" prompt and "profile error"
-    // dialog on the next launch. Only force-kill if the graceful close does not
-    // release the debug port within a short wait.
-    for pid in &snapshot.ask_pids {
-        terminate_chrome_process(pid, false);
-    }
-    if wait_for_debug_port_free(Duration::from_millis(3000)) {
+    // dialog on the next launch. Graceful close is done via CDP `Browser.close`
+    // (a bare `taskkill` without `/F` cannot deliver WM_CLOSE to a WSL-interop
+    // Chrome, so it falls through to force-kill and dirties the profile).
+    // Only force-kill if the graceful close does not release the debug port.
+    let _ = cdp_browser_close();
+    if wait_for_debug_port_free(Duration::from_millis(5000)) {
         let _ = remove_chrome_pid_file();
         return Ok(true);
     }
     for pid in &snapshot.ask_pids {
-        terminate_chrome_process(pid, true);
+        terminate_chrome_process(pid);
     }
     if wait_for_debug_port_free(Duration::from_millis(3000)) {
         let _ = remove_chrome_pid_file();
@@ -2129,29 +2272,23 @@ fn close_ask_chrome_on_debug_port(profile_path: &str) -> Result<bool, String> {
     Err("Timed out waiting for existing ask-bridge Chrome to stop".to_string())
 }
 
-/// Terminates a Windows-host Chrome process (native Windows or WSL interop).
-/// When `force` is false, uses a graceful close (WM_CLOSE) so Chrome can flush
-/// its profile; when true, force-kills the whole process tree.
-fn terminate_chrome_process(pid: &str, force: bool) {
+/// Force-kills a Windows-host Chrome process tree (native Windows or WSL
+/// interop). Graceful shutdown is handled separately via CDP `Browser.close`;
+/// this is only the fallback when the graceful close does not release the port.
+fn terminate_chrome_process(pid: &str) {
     #[cfg(target_os = "windows")]
     {
-        let mut args = vec!["/PID", pid, "/T"];
-        if force {
-            args.push("/F");
-        }
-        let _ = Command::new("taskkill").args(&args).status();
+        let _ = Command::new("taskkill")
+            .args(["/PID", pid, "/T", "/F"])
+            .status();
     }
     #[cfg(not(target_os = "windows"))]
     {
         #[cfg(target_os = "linux")]
         if is_wsl() {
             // The Chrome process is a Windows-host process; use taskkill.exe.
-            let mut args = vec!["/PID", pid, "/T"];
-            if force {
-                args.push("/F");
-            }
             let _ = Command::new("/mnt/c/Windows/System32/taskkill.exe")
-                .args(&args)
+                .args(["/PID", pid, "/T", "/F"])
                 .status();
         } else {
             let _ = Command::new("kill").args(["-TERM", pid]).status();
