@@ -391,7 +391,9 @@ impl Provider {
                 r##"[
                     "[data-testid=\"stop-button\"]",
                     "#composer-stop-button",
-                    "button[aria-label=\"Stop generating\"]"
+                    "button[aria-label=\"Stop generating\"]",
+                    "button[aria-label*=\"Stop\"]",
+                    "button[aria-label*=\"停止\"]"
                 ]"##
             }
             Provider::Gemini => {
@@ -1578,7 +1580,7 @@ fn find_linux_chrome_path(
 /// Detects whether this Linux process is running inside WSL (Windows Subsystem
 /// for Linux). WSL exposes a Windows interop binfmt_misc entry and a
 /// "microsoft"-tagged kernel release, both of which can be probed at runtime.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn is_wsl() -> bool {
     if std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists() {
         return true;
@@ -3940,6 +3942,33 @@ mod tests {
             ]
         );
         assert!(Provider::ChatGpt.owns_url(&pages[0].url));
+    }
+
+    #[test]
+    fn parses_extract_page_url_edge_cases() {
+        assert_eq!(
+            extract_page_url("ChatGPT (https://chatgpt.com/)"),
+            "https://chatgpt.com/"
+        );
+        assert_eq!(
+            extract_page_url("Page with (notes) in title (https://example.com/test)"),
+            "https://example.com/test"
+        );
+        assert_eq!(
+            extract_page_url("https://en.wikipedia.org/wiki/Rust_(programming_language)"),
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+        );
+        assert_eq!(extract_page_url("about:blank"), "about:blank");
+        assert_eq!(extract_page_url("New Tab (about:blank)"), "about:blank");
+    }
+
+    #[test]
+    fn validates_websocket_handshake_completion() {
+        let incomplete = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n";
+        assert!(!websocket_handshake_is_complete(incomplete));
+
+        let complete = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        assert!(websocket_handshake_is_complete(complete));
     }
 
     #[test]
