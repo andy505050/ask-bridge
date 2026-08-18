@@ -5866,14 +5866,6 @@ fn submit_regular_prompt(
                         try { return el.matches(s); } catch (e) { return false; }
                     });
 
-                    // 若前次回應的停止按鈕仍卡在畫面上（前端誤以為仍在生成），
-                    // 先點擊解除，避免稍後把停止按鈕誤認為送出按鈕。
-                    const stuckStop = stopSelectors.map((s) => document.querySelector(s)).find(isVisible);
-                    if (stuckStop) {
-                        stuckStop.click();
-                        await new Promise(r => setTimeout(r, 750));
-                    }
-
                     const el = composerSelectors.map((s) => document.querySelector(s)).find(Boolean);
                     if (!el) {
                         window.__submit_status = 'error: composer not found';
@@ -6101,13 +6093,6 @@ fn submit_chatgpt_agent_prompt(
                         try { return el.matches(s); } catch (e) { return false; }
                     });
 
-                    // 若前次回應的停止按鈕仍卡在畫面上（前端誤以為仍在生成），
-                    // 先點擊解除，讓真正的送出按鈕得以出現。
-                    const stuckStop = stopSelectors.map((s) => document.querySelector(s)).find(isVisible);
-                    if (stuckStop) {
-                        stuckStop.click();
-                        await new Promise(r => setTimeout(r, 750));
-                    }
                     const findAndClickSendButton = () => {
                         for (const s of sendSelectors) {
                             const btn = document.querySelector(s);
@@ -7154,12 +7139,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut finished = false;
     let mut wait_cycles = 0;
     let mut stable_done_checks = 0;
-    let mut stall_last_len: u64 = 0;
-    let mut stall_since: Option<Instant> = None;
-    // ChatGPT 前端偶爾在回應完成後仍殘留停止按鈕（誤以為仍在生成）。
-    // 若已出現新回應、無任何串流/忙碌指示、且內容長度持續這麼久未變，
-    // 則視為回應已完成，避免等待迴圈卡死到逾時。
-    const STALL_COMPLETION_SECS: u64 = 90;
     let spinner_frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut spinner_idx = 0;
 
@@ -7194,21 +7173,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     const stopButton = stopSelectors.map((selector) => document.querySelector(selector)).find(isVisible);
                     const messages = document.querySelectorAll(__ASSISTANT_SELECTOR__);
                     const isNew = messages.length > __INITIAL_COUNT__;
-                    const lastMessage = messages[messages.length - 1];
-                    const lastLen = lastMessage ? (lastMessage.innerText || '').length : 0;
-                    const busy = Boolean(document.querySelector(
-                        '.result-streaming, [data-is-streaming="true"], [aria-busy="true"], [class*="shimmer"], [class*="animate-pulse"]'
-                    ));
                     
                     if (isVisible(stopButton)) {
-                        return { status: "generating", isNew: isNew, lastLen: lastLen, busy: busy };
+                        return { status: "generating", isNew: isNew };
                     }
                     
                     if (isNew) {
-                        return { status: "done", isNew: isNew, lastLen: lastLen, busy: busy };
+                        return { status: "done", isNew: isNew };
                     }
                     
-                    return { status: "waiting", isNew: isNew, lastLen: lastLen, busy: busy };
+                    return { status: "waiting", isNew: isNew };
                 }"#
             .replace("__STOP_SELECTORS__", stop_selectors)
             .replace("__ASSISTANT_SELECTOR__", &assistant_selector)
@@ -7238,8 +7212,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(parsed) = parse_script_result(&check_res) {
                 let status = parsed["status"].as_str().unwrap_or("waiting");
                 let is_new = parsed["isNew"].as_bool().unwrap_or(false);
-                let last_len = parsed["lastLen"].as_u64().unwrap_or(0);
-                let busy = parsed["busy"].as_bool().unwrap_or(false);
 
                 if status == "done" && is_new {
                     stable_done_checks += 1;
@@ -7248,46 +7220,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 } else {
                     stable_done_checks = 0;
-                }
-
-                // Stall 後援：停止按鈕卡住但回應內容早已完成的情況。
-                if status == "generating" && is_new && !busy && last_len > 0 {
-                    if last_len == stall_last_len {
-                        if let Some(since) = stall_since {
-                            if since.elapsed() >= Duration::from_secs(STALL_COMPLETION_SECS) {
-                                if command_verbose {
-                                    println!(
-                                        "\nResponse content has been stable for {}s with a lingering stop button; treating it as complete.",
-                                        STALL_COMPLETION_SECS
-                                    );
-                                }
-                                // 點擊卡住的停止按鈕，讓前端結束「生成中」狀態，
-                                // 促使回應工具列（複製按鈕）出現。
-                                let dismiss_js = r#"() => {
-                                        const stopSelectors = __STOP_SELECTORS__;
-                                        const btn = stopSelectors.map((s) => document.querySelector(s)).find(Boolean);
-                                        if (btn) { btn.click(); return true; }
-                                        return false;
-                                    }"#
-                                .replace("__STOP_SELECTORS__", provider.stop_button_selectors_json());
-                                let _ = call_mcp_tool(
-                                    &config_path,
-                                    "evaluate_script",
-                                    serde_json::json!({ "function": dismiss_js }),
-                                );
-                                thread::sleep(Duration::from_millis(1000));
-                                finished = true;
-                            }
-                        } else {
-                            stall_since = Some(Instant::now());
-                        }
-                    } else {
-                        stall_last_len = last_len;
-                        stall_since = Some(Instant::now());
-                    }
-                } else {
-                    stall_last_len = last_len;
-                    stall_since = None;
                 }
             }
         }
